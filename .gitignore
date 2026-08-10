@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Streamlit secrets -- NEVER commit this. Copy secrets.toml.example instead.
+.streamlit/secrets.toml
+
+# Streamlit's local disk cache (downloaded Natural Earth/EEZ data, etc.)
+.streamlit/cache/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# App working files
+*.log
