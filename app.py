@@ -2,9 +2,11 @@ import base64
 import hashlib
 import io
 import json
+import os
 import re
 import tempfile
 import unicodedata
+import uuid
 import zipfile
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -34,22 +36,16 @@ ISO_ALPHA2_SEARCH_URL_DEFAULT = "https://www.iso.org/obp/ui/#search"
 # Put these in Streamlit secrets (Streamlit Cloud -> App -> Settings -> Secrets)
 # GITHUB_TOKEN="ghp_..."
 # GITHUB_REPO="username/repo"
-# HISTORY_PATH="history/upload_history.json"
+# HISTORY_PATH="history/upload_history.json"   # fallback only; each user gets their own file
+# ACCOUNTS_PATH="accounts/users.json"
 # BRANCH="main"
 
 
 def _github_persistence_available() -> tuple[bool, str]:
     """
-    True if GitHub-backed upload-history persistence is configured and
-    usable (GITHUB_TOKEN + GITHUB_REPO present in .streamlit/secrets.toml).
-
-    This is an OPTIONAL feature: on a fresh clone/machine with no secrets.toml
-    at all, the app must still start and run normally -- just without
-    persisted history across restarts -- rather than crashing on load.
-    Streamlit raises different exception types across versions when secrets
-    are missing entirely vs. just a key being absent (missing-file error,
-    KeyError-style, etc.), so this catches broadly on purpose: any failure
-    here just means "persistence off", never "app won't start".
+    True/False whether GITHUB_TOKEN + GITHUB_REPO are configured, plus a reason
+    string when they aren't. Catches broadly on purpose: any failure here just
+    means "persistence is off for this run", never "the app won't start".
     """
     try:
         token = st.secrets.get("GITHUB_TOKEN")
@@ -92,14 +88,192 @@ def gh_write_json(path: str, obj, message: str, sha: str | None, branch: str = "
     return r.json()
 
 
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ============================================================
+# Per-user accounts (login / sign up)
+# ============================================================
+# Accounts are stored as a single JSON object on GitHub (ACCOUNTS_PATH),
+# keyed by a sanitized, lowercase username, e.g.:
+#   {"frank": {"password_hash": "...", "salt": "...", "created_at": "..."}}
+# Passwords are never stored in plain text -- PBKDF2-HMAC-SHA256 with a
+# random per-user salt (stdlib hashlib, no extra dependency needed).
+#
+# If GitHub persistence isn't configured (no secrets.toml), accounts and
+# history simply live in memory for that session only -- login/sign-up
+# still works, it just won't survive an app restart. This mirrors how the
+# rest of this app degrades gracefully when a source authority is
+# unavailable, rather than crashing.
+
+ACCOUNTS_PATH_DEFAULT = "accounts/users.json"
+_PBKDF2_ITERATIONS = 200_000
+
+
+def _sanitize_username(raw: str) -> str:
+    """Lowercase, trim, keep only [a-z0-9_-] -- used both as the account key
+    and as the per-user history filename, so it must be filesystem/URL safe."""
+    raw = (raw or "").strip().lower()
+    return re.sub(r"[^a-z0-9_-]", "", raw)
+
+
+def _hash_password(password: str, salt_hex: str) -> str:
+    salt = bytes.fromhex(salt_hex)
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS).hex()
+
+
+def _load_accounts() -> dict:
+    if "_accounts_cache" in st.session_state:
+        return st.session_state["_accounts_cache"]
+
+    accounts: dict = {}
+    available, _reason = _github_persistence_available()
+    if available:
+        try:
+            path = st.secrets.get("ACCOUNTS_PATH", ACCOUNTS_PATH_DEFAULT)
+            branch = st.secrets.get("BRANCH", "main")
+            loaded, sha = gh_read_json(path, branch=branch)
+            if isinstance(loaded, dict):
+                accounts = loaded
+            st.session_state["_accounts_sha"] = sha
+        except Exception:
+            st.session_state["_accounts_sha"] = None
+    st.session_state["_accounts_cache"] = accounts
+    st.session_state["_accounts_persistence_available"] = available
+    return accounts
+
+
+def _save_accounts(accounts: dict) -> bool:
+    st.session_state["_accounts_cache"] = accounts
+    available, _reason = _github_persistence_available()
+    if not available:
+        return False
+    path = st.secrets.get("ACCOUNTS_PATH", ACCOUNTS_PATH_DEFAULT)
+    branch = st.secrets.get("BRANCH", "main")
+    for attempt in range(2):
+        try:
+            _current, sha = gh_read_json(path, branch=branch)
+            gh_write_json(path=path, obj=accounts, message="Update accounts", sha=sha, branch=branch)
+            return True
+        except Exception:
+            if attempt == 0:
+                continue
+            return False
+    return False
+
+
+def _create_account(username: str, password: str) -> tuple[bool, str]:
+    accounts = _load_accounts()
+    if username in accounts:
+        return False, "That username is already taken."
+    salt_hex = os.urandom(16).hex()
+    accounts[username] = {
+        "password_hash": _hash_password(password, salt_hex),
+        "salt": salt_hex,
+        "created_at": utc_now_iso(),
+    }
+    _save_accounts(accounts)
+    return True, "Account created."
+
+
+def _check_login(username: str, password: str) -> bool:
+    accounts = _load_accounts()
+    record = accounts.get(username)
+    if not record:
+        return False
+    return _hash_password(password, record.get("salt", "")) == record.get("password_hash")
+
+
+def _user_history_path(username: str) -> str:
+    return f"history/user_{username}.json"
+
+
+def _switch_to_user(username: str):
+    """Sets the logged-in user and (re)loads *their own* history only."""
+    st.session_state["auth_username"] = username
+    st.session_state["_user_history_path"] = _user_history_path(username)
+    st.session_state["_history_loaded"] = False
+    st.session_state["upload_history"] = []
+    st.session_state["_history_paused_versions"] = set()
+    for k in ("current_version_id", "current_uploaded_at"):
+        st.session_state.pop(k, None)
+    load_persisted_history()
+
+
+def _log_out():
+    for k in (
+        "auth_username", "_user_history_path", "_history_loaded", "upload_history",
+        "current_version_id", "current_uploaded_at", "_new_load_event",
+        "_history_paused_versions", "_active_upload_version_id",
+    ):
+        st.session_state.pop(k, None)
+
+
+def render_auth_gate() -> bool:
+    """
+    Draws the login / sign-up UI. Returns True (and draws nothing else) once
+    someone is logged in for this session; otherwise draws the form and
+    returns False so the caller can st.stop().
+    """
+    if st.session_state.get("auth_username"):
+        return True
+
+    st.subheader("Log in or create an account")
+    available, _reason = _github_persistence_available()
+    if not available:
+        st.info(
+            "GitHub persistence isn't configured, so accounts and history will only "
+            "last for this browser session (they won't survive an app restart). "
+            "That's fine for trying the app out."
+        )
+
+    tab_login, tab_signup = st.tabs(["Log in", "Create account"])
+
+    with tab_login:
+        with st.form("login_form"):
+            login_user = st.text_input("Username", key="login_username")
+            login_pass = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Log in")
+        if submitted:
+            username = _sanitize_username(login_user)
+            if not username or not login_pass:
+                st.error("Enter a username and password.")
+            elif _check_login(username, login_pass):
+                _switch_to_user(username)
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
+
+    with tab_signup:
+        with st.form("signup_form"):
+            new_user = st.text_input("Choose a username", key="signup_username")
+            new_pass = st.text_input("Choose a password", type="password", key="signup_password")
+            new_pass2 = st.text_input("Confirm password", type="password", key="signup_password2")
+            submitted2 = st.form_submit_button("Create account")
+        if submitted2:
+            username = _sanitize_username(new_user)
+            if not username:
+                st.error("Username must contain at least one letter, number, - or _.")
+            elif len(new_pass) < 4:
+                st.error("Password must be at least 4 characters.")
+            elif new_pass != new_pass2:
+                st.error("Passwords do not match.")
+            else:
+                ok, msg = _create_account(username, new_pass)
+                if ok:
+                    _switch_to_user(username)
+                    st.success("Account created -- you're logged in.")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    return False
+
+
 def load_persisted_history():
-    """
-    Loads persisted history from GitHub into session_state (once). No-ops
-    into an empty in-memory history -- instead of raising -- if GitHub
-    persistence isn't configured or the read fails for any reason (bad
-    token, repo doesn't exist yet, offline, etc.). See
-    _github_persistence_available().
-    """
+    """Loads the CURRENTLY LOGGED-IN user's persisted history from GitHub
+    into session_state (once per login)."""
     if st.session_state.get("_history_loaded", False):
         return
 
@@ -108,13 +282,15 @@ def load_persisted_history():
     if not available:
         st.session_state["_history_persistence_available"] = False
         st.session_state["_history_persistence_reason"] = (
-            reason or "GITHUB_TOKEN/GITHUB_REPO not set in .streamlit/secrets.toml"
+            reason or "GITHUB_TOKEN/GITHUB_REPO not set -- history will only last this session."
         )
         st.session_state["_history_loaded"] = True
         return
 
     try:
-        path = st.secrets.get("HISTORY_PATH", "history/upload_history.json")
+        path = st.session_state.get("_user_history_path") or st.secrets.get(
+            "HISTORY_PATH", "history/upload_history.json"
+        )
         branch = st.secrets.get("BRANCH", "main")
         history, _sha = gh_read_json(path, branch=branch)
         if not isinstance(history, list):
@@ -124,30 +300,27 @@ def load_persisted_history():
     except Exception as e:
         st.session_state["_history_persistence_available"] = False
         st.session_state["_history_persistence_reason"] = str(e)
-
     st.session_state["_history_loaded"] = True
 
 
 def append_persisted_history(new_record: dict):
     """
-    Appends a record to GitHub JSON file with a simple retry to handle
-    concurrent edits. Always appends to st.session_state first, so the
-    current session's results are never lost even if GitHub persistence is
-    unavailable or the write fails -- persistence across restarts is
-    best-effort, not required for the app to function.
+    Appends a record to the CURRENT user's GitHub JSON file with a simple
+    retry to handle concurrent edits. Also appends to st.session_state.
     """
-    # Always keep session_state in sync
     if "upload_history" not in st.session_state or not isinstance(
         st.session_state["upload_history"], list
     ):
         st.session_state["upload_history"] = []
     st.session_state["upload_history"].append(new_record)
 
-    available, _ = _github_persistence_available()
+    available, _reason = _github_persistence_available()
     if not available:
         return
 
-    path = st.secrets.get("HISTORY_PATH", "history/upload_history.json")
+    path = st.session_state.get("_user_history_path") or st.secrets.get(
+        "HISTORY_PATH", "history/upload_history.json"
+    )
     branch = st.secrets.get("BRANCH", "main")
 
     # Retry once in case of SHA conflict
@@ -176,11 +349,55 @@ def append_persisted_history(new_record: dict):
             return
 
 
-def utc_now_iso():
-    return datetime.now(timezone.utc).isoformat()
+def _is_history_paused_for(*version_ids) -> bool:
+    """True if any of the given ids belongs to the dataset that was active at
+    the moment history was last cleared -- used to stop that SAME upload from
+    instantly reappearing in history on the next rerun. Tracking resumes on
+    its own the moment a genuinely different dataset is uploaded, since a new
+    file's id will never be in this paused set."""
+    paused = st.session_state.get("_history_paused_versions") or set()
+    return any(v in paused for v in version_ids if v)
 
 
-load_persisted_history()
+def clear_user_history():
+    """
+    Wipes the CURRENT user's history (in-session and on GitHub) in the
+    Panels/dashboard view only. The dataset that's still sitting in the file
+    uploader right now is remembered so it is NOT immediately re-added back
+    into history on the next rerun -- tracking only starts again once the
+    person actually uploads a new (different) dataset.
+    """
+    st.session_state["upload_history"] = []
+    st.session_state["_history_paused_versions"] = {
+        v for v in (
+            st.session_state.get("current_version_id"),
+            st.session_state.get("_active_upload_version_id"),
+        ) if v
+    }
+    available, _reason = _github_persistence_available()
+    if not available:
+        return
+    path = st.session_state.get("_user_history_path") or st.secrets.get(
+        "HISTORY_PATH", "history/upload_history.json"
+    )
+    branch = st.secrets.get("BRANCH", "main")
+    try:
+        _current, sha = gh_read_json(path, branch=branch)
+        gh_write_json(path=path, obj=[], message="Clear upload history", sha=sha, branch=branch)
+    except Exception as e:
+        st.warning(f"Could not clear history on GitHub (cleared locally only): {e}")
+
+
+def start_new_history_session():
+    """Starts a fresh tracked upload 'version' without touching previously
+    saved history -- the next upload is logged as a brand-new entry even if
+    it's the same file as before."""
+    st.session_state["current_version_id"] = (
+        f"v{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    )
+    st.session_state["current_uploaded_at"] = utc_now_iso()
+    st.session_state["_new_load_event"] = False
+    st.session_state["_history_paused_versions"] = set()
 
 # ============================================================
 # Helper functions
@@ -901,7 +1118,7 @@ GETTY_RECONCILE_PROP_COORDINATES = "/tgn_coordinates"
 # Supplementary local reference: Getty's reconciliation API does not expose ISO
 # 3166-1 alpha-2 codes as an extend property (only preferred/variant terms, notes,
 # hierarchy, place types, and coordinates are available), so the code half of
-# DQ_COUNTRY_COUNTRYCODE_CONSISTENT is checked against this table once TGN has
+# VALIDATION_COUNTRY_COUNTRYCODE_CONSISTENT is checked against this table once TGN has
 # confirmed dwc:country is a real, unambiguous nation. This is a FAST PATH only
 # -- a hand-curated table for the countries most common in this project's data,
 # not the only source consulted. Anything TGN confirms as a real nation but that
@@ -950,7 +1167,7 @@ def _pycountry_name_lookup() -> dict:
     `common_name` is "Bolivia" -- both variants are indexed here). pycountry
     is a maintained mirror of the real ISO 3166-1 database (sourced from
     Debian's iso-codes project), not a hand-typed table -- this is what lets
-    DQ_COUNTRY_COUNTRYCODE_CONSISTENT verify the code for any TGN-confirmed
+    VALIDATION_COUNTRY_COUNTRYCODE_CONSISTENT verify the code for any TGN-confirmed
     nation, not just the ~57 in the TGN_COUNTRY_ISO2 fast-path table above.
     Returns {} if pycountry isn't installed.
     """
@@ -1213,8 +1430,8 @@ def _tgn_reconcile_state_found(state_name_norm: str, endpoint: str) -> bool:
     checked two ways so this test is driven by TGN itself, not capped by the
     app's small local reference table:
       1) Fast path -- the breadcrumb component matches the app's local
-         TGN_COUNTRY_ISO2 table (same table DQ_COUNTRY_COUNTRYCODE_CONSISTENT /
-         DQ_COUNTRY_STATEPROVINCE_UNAMBIGUOUS use).
+         TGN_COUNTRY_ISO2 table (same table VALIDATION_COUNTRY_COUNTRYCODE_CONSISTENT /
+         VALIDATION_COUNTRY_STATEPROVINCE_UNAMBIGUOUS use).
       2) Fallback -- for any breadcrumb component not in that local table,
          ask TGN itself (via _tgn_reconcile_nation_id) whether that name
          resolves, unambiguously, to a place TGN classifies with place type
@@ -1259,7 +1476,7 @@ def _tgn_reconcile_state_found(state_name_norm: str, endpoint: str) -> bool:
 
 
 # ============================================================
-# TEST 1: DQ_COUNTRY_COUNTRYCODE_CONSISTENT (TGN-backed)
+# TEST 1: VALIDATION_COUNTRY_COUNTRYCODE_CONSISTENT (TGN-backed)
 # ============================================================
 def test_country_countrycode_consistent(
     country_series: pd.Series,
@@ -1323,7 +1540,7 @@ def test_country_countrycode_consistent(
 
 
 # ============================================================
-# TEST 2: DQ_COUNTRY_STATEPROVINCE_UNAMBIGUOUS (TGN-backed)
+# TEST 2: VALIDATION_COUNTRY_STATEPROVINCE_UNAMBIGUOUS (TGN-backed)
 # ============================================================
 def test_country_stateprovince_unambiguous(
     country_series: pd.Series,
@@ -1398,7 +1615,7 @@ def test_stateprovince_found(
     COMPLIANT if dwc:stateProvince resolves (by exact name match) to at
     least one TGN place whose parent hierarchy names an ISO 3166
     country-like entity -- see _tgn_reconcile_state_found() docstring.
-    Unlike DQ_COUNTRY_STATEPROVINCE_UNAMBIGUOUS, this does not require or
+    Unlike VALIDATION_COUNTRY_STATEPROVINCE_UNAMBIGUOUS, this does not require or
     use dwc:country at all.
     """
     sa = source_authority or TGN_SOURCE_AUTHORITY_DEFAULT
@@ -1437,8 +1654,8 @@ def test_country_found(
     bdq:sourceAuthority default = Getty TGN (via GETTY_RECONCILE)
     COMPLIANT if dwc:country resolves unambiguously to ONE TGN place whose
     place type is equivalent to "nation" -- see _tgn_reconcile_nation_id()
-    docstring (same resolver DQ_COUNTRY_COUNTRYCODE_CONSISTENT and
-    DQ_COUNTRY_STATEPROVINCE_UNAMBIGUOUS use for the country half of their
+    docstring (same resolver VALIDATION_COUNTRY_COUNTRYCODE_CONSISTENT and
+    VALIDATION_COUNTRY_STATEPROVINCE_UNAMBIGUOUS use for the country half of their
     checks). Unlike a plain non-empty check, a value that's present but not a
     real, unambiguous nation-level place (a typo, a state/province name, a
     historical or disputed territory TGN doesn't classify as a nation, etc.)
@@ -1824,7 +2041,7 @@ def test_maximumelevation_inrange(
 # Default Parameter Values:
 #   bdqval:minimumValidElevationInMeters default = "-430"
 #   bdqval:maximumValidElevationInMeters default = "8850"
-# (Same default valid-elevation range as DQ_MAXIMUMELEVATIONINMETERS_INRANGE,
+# (Same default valid-elevation range as VALIDATION_MAXIMUMELEVATIONINMETERS_INRANGE,
 # reusing DEFAULT_MIN_VALID_ELEVATION_M / DEFAULT_MAX_VALID_ELEVATION_M.)
 # ============================================================
 def test_minimumelevation_inrange(
@@ -1893,9 +2110,425 @@ def test_location_notempty(df_row):
 # ============================================================
 # Streamlit UI
 # ============================================================
+# ============================================================
+# Official TDWG Biodiversity Data Quality (BDQ) TG2 test specifications
+# for the tests implemented in this app -- sourced from the authoritative
+# GitHub issue for each test at https://github.com/tdwg/bdq/issues
+# (one issue per CORE test; the issue body carries the ratified Description,
+# Dimension, Type, Darwin Core Class, Information Elements, and Expected
+# Response text, which is quoted verbatim below).
+#
+# A few of this app's test columns don't map onto a distinct, separately
+# numbered CORE test in the standard (confirmed=False below); for those the
+# description reflects this app's own implementation instead, clearly
+# labeled as such rather than presented as ratified BDQ wording.
+# ============================================================
+BDQ_TEST_SPECS = {
+    "VALIDATION_COUNTRY_NOT_EMPTY": {
+        "official_name": "VALIDATION_COUNTRY_NOTEMPTY",
+        "description": "Is there a value in dwc:country?",
+        "dimension": "Completeness",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:country"],
+        "expected_response": (
+            'COMPLIANT if dwc:country is bdq:NotEmpty or dwc:countryCode has a value of "XZ" and '
+            'either dwc:country is bdq:Empty or has a value of "High seas"; otherwise NOT_COMPLIANT'
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/42",
+        "confirmed": True,
+    },
+    "VALIDATION_COORDINATES_COUNTRYCODE_CONSISTENT": {
+        "official_name": "VALIDATION_COORDINATESCOUNTRYCODE_CONSISTENT",
+        "description": (
+            "Do the geographic coordinates fall on or within the boundaries of the territory given "
+            "in dwc:countryCode or its Exclusive Economic Zone?"
+        ),
+        "dimension": "Consistency",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:countryCode", "dwc:decimalLatitude", "dwc:decimalLongitude"],
+        "parameters": ["bdq:sourceAuthority", "bdq:spatialBufferInMeters"],
+        "expected_response": (
+            "EXTERNAL_PREREQUISITES_NOT_MET if the bdq:sourceAuthority is not available; "
+            "INTERNAL_PREREQUISITES_NOT_MET if dwc:decimalLatitude, dwc:decimalLongitude or "
+            "dwc:countryCode are bdq:Empty or not valid/interpretable; COMPLIANT if the coordinates "
+            "fall within the boundary of the territory given by dwc:countryCode, or within its "
+            "Exclusive Economic Zone, plus bdq:spatialBufferInMeters; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/50",
+        "confirmed": True,
+    },
+    "VALIDATION_COORDINATES_STATEPROVINCE_CONSISTENT": {
+        "official_name": "VALIDATION_COORDINATESSTATEPROVINCE_CONSISTENT",
+        "description": (
+            "Do the geographic coordinates fall on or within the boundary from the bdq:sourceAuthority "
+            "for the given dwc:stateProvince, or within the distance given by "
+            "bdq:spatialBufferInMeters outside that boundary?"
+        ),
+        "dimension": "Consistency",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:stateProvince", "dwc:decimalLatitude", "dwc:decimalLongitude"],
+        "parameters": [
+            'bdq:sourceAuthority (default: "10m-admin-1 boundaries")',
+            'bdq:spatialBufferInMeters (default: "3000")',
+        ],
+        "expected_response": (
+            "EXTERNAL_PREREQUISITES_NOT_MET if the bdq:sourceAuthority is not available; "
+            "INTERNAL_PREREQUISITES_NOT_MET if the coordinates or dwc:stateProvince are empty, "
+            "invalid, or dwc:stateProvince is not found in the bdq:sourceAuthority; COMPLIANT if the "
+            "coordinates fall within the dwc:stateProvince boundary (or within the specified buffer "
+            "distance of it); otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/56",
+        "confirmed": True,
+    },
+    "VALIDATION_COORDINATES_NOTZERO": {
+        "official_name": "VALIDATION_COORDINATES_NOTZERO",
+        "description": (
+            "Are the values of either dwc:decimalLatitude or dwc:decimalLongitude numbers that are "
+            "not equal to 0?"
+        ),
+        "dimension": "Likeliness",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:decimalLatitude", "dwc:decimalLongitude"],
+        "expected_response": (
+            "INTERNAL_PREREQUISITES_NOT_MET if dwc:decimalLatitude is bdq:Empty or is not "
+            "interpretable as a number, or dwc:decimalLongitude is bdq:Empty or is not interpretable "
+            "as a number; COMPLIANT if either the value of dwc:decimalLatitude is not = 0 or the "
+            "value of dwc:decimalLongitude is not = 0; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/87",
+        "confirmed": True,
+    },
+    "VALIDATION_COORDINATEUNCERTAINTY_INRANGE": {
+        "official_name": None,
+        "description": (
+            "Is the value of dwc:coordinateUncertaintyInMeters a number between 1 and 20,037,509 "
+            "(half of the Earth's circumference, in meters) inclusive?"
+        ),
+        "dimension": "Conformance",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:coordinateUncertaintyInMeters"],
+        "expected_response": (
+            "INTERNAL_PREREQUISITES_NOT_MET if dwc:coordinateUncertaintyInMeters is bdq:Empty or is "
+            "not interpretable as a number; COMPLIANT if the value is between 1 and 20037509 "
+            "inclusive; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": None,
+        "confirmed": False,
+    },
+    "VALIDATION_COUNTRYCODE_NOTEMPTY": {
+        "official_name": None,
+        "description": "Is there a value in dwc:countryCode?",
+        "dimension": "Completeness",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:countryCode"],
+        "expected_response": "COMPLIANT if dwc:countryCode is bdq:NotEmpty; otherwise NOT_COMPLIANT",
+        "issue_url": None,
+        "confirmed": False,
+    },
+    "VALIDATION_COUNTRYCODE_STANDARD": {
+        "official_name": "VALIDATION_COUNTRYCODE_STANDARD",
+        "description": "Is the value of dwc:countryCode a valid ISO 3166-1-alpha-2 country code?",
+        "dimension": "Conformance",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:countryCode"],
+        "expected_response": (
+            "EXTERNAL_PREREQUISITES_NOT_MET if the bdq:sourceAuthority is not available; "
+            "INTERNAL_PREREQUISITES_NOT_MET if the dwc:countryCode is bdq:Empty; COMPLIANT if "
+            "dwc:countryCode can be unambiguously interpreted as a valid ISO 3166-1-alpha-2 country "
+            "code in the bdq:sourceAuthority; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/20",
+        "confirmed": True,
+    },
+    "VALIDATION_COUNTRY_COUNTRYCODE_CONSISTENT": {
+        "official_name": "VALIDATION_COUNTRYCOUNTRYCODE_CONSISTENT",
+        "description": (
+            "Does the ISO country code, determined from the value of dwc:country, equal the value of "
+            "dwc:countryCode?"
+        ),
+        "dimension": "Consistency",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:country", "dwc:countryCode"],
+        "expected_response": (
+            "EXTERNAL_PREREQUISITES_NOT_MET if the bdq:sourceAuthority is not available; "
+            "INTERNAL_PREREQUISITES_NOT_MET if either of the terms dwc:country or dwc:countryCode "
+            "are bdq:Empty; COMPLIANT if the values of dwc:country and dwc:countryCode match the "
+            "national-level country name and matching country code respectively in the "
+            "bdq:sourceAuthority; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/62",
+        "confirmed": True,
+    },
+    "VALIDATION_COUNTRY_STATEPROVINCE_UNAMBIGUOUS": {
+        "official_name": None,
+        "description": (
+            "Is the value of dwc:stateProvince unambiguous (found in the bdq:sourceAuthority as a "
+            "child administrative entity of the country given by dwc:country/dwc:countryCode, "
+            "without matching more than one country)?"
+        ),
+        "dimension": "Consistency",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:country", "dwc:countryCode", "dwc:stateProvince"],
+        "expected_response": (
+            "EXTERNAL_PREREQUISITES_NOT_MET if the bdq:sourceAuthority is not available; "
+            "INTERNAL_PREREQUISITES_NOT_MET if dwc:stateProvince and dwc:country/dwc:countryCode are "
+            "empty; COMPLIANT if dwc:stateProvince resolves to exactly one place in the "
+            "bdq:sourceAuthority consistent with dwc:country/dwc:countryCode; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": None,
+        "confirmed": False,
+    },
+    "VALIDATION_STATEPROVINCE_FOUND": {
+        "official_name": "VALIDATION_STATEPROVINCE_FOUND",
+        "description": "Does the value of dwc:stateProvince occur in the bdq:sourceAuthority?",
+        "dimension": "Conformance",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:stateProvince"],
+        "expected_response": (
+            "EXTERNAL_PREREQUISITES_NOT_MET if the bdq:sourceAuthority is not available; "
+            "INTERNAL_PREREQUISITES_NOT_MET if dwc:stateProvince is bdq:Empty; COMPLIANT if the "
+            "value of dwc:stateProvince occurs as an administrative entity that is a child to at "
+            "least one entity representing an ISO 3166 country-like entity in the "
+            "bdq:sourceAuthority; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/199",
+        "confirmed": True,
+    },
+    "VALIDATION_COUNTRY_FOUND": {
+        "official_name": "VALIDATION_COUNTRY_FOUND",
+        "description": "Does the value of dwc:country occur in the bdq:sourceAuthority?",
+        "dimension": "Conformance",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:country"],
+        "expected_response": (
+            "EXTERNAL_PREREQUISITES_NOT_MET if the bdq:sourceAuthority is not available; "
+            "INTERNAL_PREREQUISITES_NOT_MET if dwc:country is bdq:Empty; COMPLIANT if the value of "
+            "dwc:country is a place type equivalent to administrative entity of 'nation' in the "
+            "bdq:sourceAuthority; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/21",
+        "confirmed": True,
+    },
+    "VALIDATION_DECIMALLATITUDE_INRANGE": {
+        "official_name": "VALIDATION_DECIMALLATITUDE_INRANGE",
+        "description": "Is the value of dwc:decimalLatitude a number between -90 and 90 inclusive?",
+        "dimension": "Conformance",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:decimalLatitude"],
+        "expected_response": (
+            "INTERNAL_PREREQUISITES_NOT_MET if dwc:decimalLatitude is bdq:Empty or the value is not "
+            "a number; COMPLIANT if the value of dwc:decimalLatitude is between -90 and 90 degrees, "
+            "inclusive; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/79",
+        "confirmed": True,
+    },
+    "VALIDATION_DECIMALLATITUDE_NOTEMPTY": {
+        "official_name": "VALIDATION_DECIMALLATITUDE_NOTEMPTY",
+        "description": "Is there a value in dwc:decimalLatitude?",
+        "dimension": "Completeness",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:decimalLatitude"],
+        "expected_response": "COMPLIANT if dwc:decimalLatitude is bdq:NotEmpty; otherwise NOT_COMPLIANT",
+        "issue_url": "https://github.com/tdwg/bdq/issues/119",
+        "confirmed": True,
+    },
+    "VALIDATION_DECIMALLONGITUDE_INRANGE": {
+        "official_name": "VALIDATION_DECIMALLONGITUDE_INRANGE",
+        "description": "Is the value of dwc:decimalLongitude a number between -180 and 180 inclusive?",
+        "dimension": "Conformance",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:decimalLongitude"],
+        "expected_response": (
+            "INTERNAL_PREREQUISITES_NOT_MET if dwc:decimalLongitude is bdq:Empty or the value is "
+            "not a number; COMPLIANT if the value of dwc:decimalLongitude is between -180 and 180 "
+            "degrees, inclusive; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/30",
+        "confirmed": True,
+    },
+    "VALIDATION_DECIMALLONGITUDE_NOTEMPTY": {
+        "official_name": "VALIDATION_DECIMALLONGITUDE_NOTEMPTY",
+        "description": "Is there a value in dwc:decimalLongitude?",
+        "dimension": "Completeness",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:decimalLongitude"],
+        "expected_response": "COMPLIANT if dwc:decimalLongitude is bdq:NotEmpty; otherwise NOT_COMPLIANT",
+        "issue_url": "https://github.com/tdwg/bdq/issues/96",
+        "confirmed": True,
+    },
+    "VALIDATION_GEODETICDATUM_NOTEMPTY": {
+        "official_name": "VALIDATION_GEODETICDATUM_NOTEMPTY",
+        "description": "Is there a value in dwc:geodeticDatum?",
+        "dimension": "Completeness",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:geodeticDatum"],
+        "expected_response": "COMPLIANT if dwc:geodeticDatum is bdq:NotEmpty; otherwise NOT_COMPLIANT",
+        "issue_url": "https://github.com/tdwg/bdq/issues/78",
+        "confirmed": True,
+    },
+    "VALIDATION_GEODETICDATUM_STANDARD": {
+        "official_name": "VALIDATION_GEODETICDATUM_STANDARD",
+        "description": (
+            "Does the value of dwc:geodeticDatum occur as a valid geographic CRS, geodetic Datum or "
+            "ellipsoid in bdq:sourceAuthority?"
+        ),
+        "dimension": "Conformance",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:geodeticDatum"],
+        "expected_response": (
+            "EXTERNAL_PREREQUISITES_NOT_MET if the bdq:sourceAuthority is not available; "
+            "INTERNAL_PREREQUISITES_NOT_MET if dwc:geodeticDatum is bdq:Empty; COMPLIANT if the "
+            'value of dwc:geodeticDatum is a valid code from the bdq:sourceAuthority (in the form '
+            'Authority:Number) for a Datum, ellipsoid, or a CRS appropriate for a 2D geographic '
+            'coordinate in degrees, or is the value "not recorded"; otherwise NOT_COMPLIANT'
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/59",
+        "confirmed": True,
+    },
+    "VALIDATION_MAXIMUMELEVATIONINMETERS_INRANGE": {
+        "official_name": "VALIDATION_MAXELEVATION_INRANGE",
+        "description": "Is the value of dwc:maximumElevationInMeters of a single record within a valid range?",
+        "dimension": "Conformance",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:maximumElevationInMeters"],
+        "parameters": ["bdq:minimumValidElevationInMeters", "bdq:maximumValidElevationInMeters"],
+        "expected_response": (
+            "INTERNAL_PREREQUISITES_NOT_MET if dwc:maximumElevationInMeters is bdq:Empty or the "
+            "value cannot be interpreted as a number; COMPLIANT if the value of "
+            "dwc:maximumElevationInMeters is within the range of bdq:minimumValidElevationInMeters "
+            "to bdq:maximumValidElevationInMeters inclusive; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/112",
+        "confirmed": True,
+    },
+    "VALIDATION_MINIMUMELEVATIONINMETERS_INRANGE": {
+        "official_name": "VALIDATION_MINELEVATION_INRANGE",
+        "description": "Is the value of dwc:minimumElevationInMeters within the parameter range?",
+        "dimension": "Conformance",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:minimumElevationInMeters"],
+        "parameters": ["bdq:minimumValidElevationInMeters", "bdq:maximumValidElevationInMeters"],
+        "expected_response": (
+            "INTERNAL_PREREQUISITES_NOT_MET if dwc:minimumElevationInMeters is bdq:Empty or the "
+            "value is not a number; COMPLIANT if the value of dwc:minimumElevationInMeters is "
+            "within the range of bdq:minimumValidElevationInMeters to "
+            "bdq:maximumValidElevationInMeters inclusive; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/39",
+        "confirmed": True,
+    },
+    "VALIDATION_MINELEVATION_LESSTHAN_MAXELEVATION": {
+        "official_name": None,
+        "description": (
+            "Is the value of dwc:minimumElevationInMeters less than or equal to the value of "
+            "dwc:maximumElevationInMeters? (modeled on the ratified depth equivalent, "
+            "VALIDATION_MINDEPTH_LESSTHAN_MAXDEPTH)"
+        ),
+        "dimension": "Consistency",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": ["dwc:minimumElevationInMeters", "dwc:maximumElevationInMeters"],
+        "expected_response": (
+            "INTERNAL_PREREQUISITES_NOT_MET if either dwc:minimumElevationInMeters or "
+            "dwc:maximumElevationInMeters is bdq:Empty or not interpretable as a number; COMPLIANT "
+            "if the value of dwc:minimumElevationInMeters is less than or equal to the value of "
+            "dwc:maximumElevationInMeters; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/24",
+        "confirmed": False,
+    },
+    "VALIDATION_LOCATION_NOTEMPTY": {
+        "official_name": "VALIDATION_LOCATION_NOTEMPTY",
+        "description": "Is there a value in any of the Darwin Core spatial terms that could specify a location?",
+        "dimension": "Completeness",
+        "type": "Validation",
+        "dwc_class": "dcterms:Location",
+        "elements_acted_upon": [
+            "dwc:higherGeographyID", "dwc:higherGeography", "dwc:continent", "dwc:country",
+            "dwc:countryCode", "dwc:stateProvince", "dwc:county", "dwc:municipality",
+            "dwc:waterBody", "dwc:island", "dwc:islandGroup", "dwc:locality", "dwc:locationID",
+            "dwc:verbatimLocality", "dwc:decimalLatitude", "dwc:decimalLongitude",
+            "dwc:verbatimCoordinates", "dwc:verbatimLatitude", "dwc:verbatimLongitude",
+            "dwc:footprintWKT",
+        ],
+        "expected_response": (
+            "COMPLIANT if at least one term needed to determine the location of the entity exists "
+            "and is bdq:NotEmpty; otherwise NOT_COMPLIANT"
+        ),
+        "issue_url": "https://github.com/tdwg/bdq/issues/40",
+        "confirmed": True,
+    },
+}
+
+
+def render_bdq_test_details(test_col: str, row_counts: dict | None = None):
+    """Renders one test's official BDQ Standard description/expected-response
+    text (or, for the few tests without a confirmed distinct CORE
+    specification, a clearly-labeled implementation-based description),
+    plus this dataset's compliance counts for it."""
+    spec = BDQ_TEST_SPECS.get(test_col)
+    if spec is None:
+        st.caption("No BDQ Standard description available for this test.")
+        return
+
+    if spec.get("confirmed"):
+        st.markdown(f"**Official BDQ test name:** `{spec['official_name']}`")
+    else:
+        st.caption(
+            "This app's test does not map onto a single, separately-numbered CORE test in the "
+            "ratified BDQ standard -- the description below reflects this test's own "
+            "implementation, written in the same Dimension/Type/Expected Response style the "
+            "standard uses."
+        )
+
+    st.markdown(f"**Description:** {spec['description']}")
+    st.markdown(f"**Data Quality Dimension:** {spec['dimension']}")
+    st.markdown(f"**Type:** {spec['type']}")
+    st.markdown(f"**Darwin Core Class:** {spec['dwc_class']}")
+    st.markdown(f"**Information Element(s) Acted Upon:** {', '.join(spec['elements_acted_upon'])}")
+    if spec.get("parameters"):
+        st.markdown(f"**Parameters:** {', '.join(spec['parameters'])}")
+    st.markdown("**Expected Response:**")
+    st.info(spec["expected_response"])
+    if spec.get("issue_url"):
+        st.caption(f"Specification source: {spec['issue_url']}")
+
+    if row_counts is not None:
+        st.markdown("**This dataset's results for this test:**")
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("Compliant", int(row_counts.get("Compliant Count", 0)))
+        cc2.metric("Not compliant", int(row_counts.get("Not Compliant Count", 0)))
+        cc3.metric("Potential issue", int(row_counts.get("Potential Issue Count", 0)))
+        cc4.metric("Prerequisite not met", int(row_counts.get("Prerequisite Not Met", 0)))
+
+
 st.set_page_config(layout="wide")
 st.title("AFRICAN TROPICAL PLANTS Geospatial Data Quality Validator")
 st.caption("Upload a CSV file with geospatial data for BDQ-style validation.")
+
+if not render_auth_gate():
+    st.stop()
 
 gdf_states = load_source_authority_gdf()
 gdf_eez = load_eez_gdf()
@@ -4127,6 +4760,17 @@ with st.sidebar:
     st.image(io.BytesIO(base64.b64decode(AFRICAN_PLANTS_LOGO_B64)), width="stretch")
 
     st.markdown("---")
+    st.markdown(f"**Logged in as:** `{st.session_state.get('auth_username', '')}`")
+    if st.button("Log out", key="btn_logout"):
+        _log_out()
+        st.rerun()
+    if not st.session_state.get("_history_persistence_available", False):
+        st.caption(
+            "History persistence: session only "
+            f"({st.session_state.get('_history_persistence_reason', 'GitHub not configured')})"
+        )
+
+    st.markdown("---")
     st.header("Source Authority Status")
     st.markdown(f"**Natural Earth Admin-1:** {'✅ Loaded' if gdf_states is not None else '❌ Not Loaded'}")
     st.markdown(f"**Marine Regions EEZ:** {'✅ Loaded' if gdf_eez is not None else '❌ Not Loaded'}")
@@ -4168,6 +4812,7 @@ if uploaded_file is None:
 raw_bytes = uploaded_file.getvalue()
 
 version_id = _file_version_id(raw_bytes)
+st.session_state["_active_upload_version_id"] = version_id
 
 df = None
 for enc in ("utf-8", "utf-16", "latin1", "cp1252"):
@@ -4200,104 +4845,104 @@ def run_all_tests(data_df, _states_gdf, _tgn_is_available: bool, _eez_gdf=None,
                    _epsg_is_available: bool = False):
     df_result = data_df.copy()
 
-    df_result["DQ_COUNTRY_NOT_EMPTY"] = test_country_not_empty(
+    df_result["VALIDATION_COUNTRY_NOT_EMPTY"] = test_country_not_empty(
         df_result.get("country", pd.Series(dtype="object")),
         df_result.get("countryCode", pd.Series(dtype="object")),
     )
 
     # ---- Natural Earth-ish polygon tests (mock) ----
     if _states_gdf is not None:
-        df_result["DQ_COORDINATES_COUNTRYCODE_CONSISTENT"] = test_coordinates_countrycode_consistent(
+        df_result["VALIDATION_COORDINATES_COUNTRYCODE_CONSISTENT"] = test_coordinates_countrycode_consistent(
             df_result["decimalLatitude"],
             df_result["decimalLongitude"],
             df_result.get("countryCode", pd.Series(dtype="object")),
             gdf=_states_gdf,
             eez_gdf=_eez_gdf,
         )
-        df_result["DQ_COORDINATES_STATEPROVINCE_CONSISTENT"] = test_coordinates_stateprovince_consistent(
+        df_result["VALIDATION_COORDINATES_STATEPROVINCE_CONSISTENT"] = test_coordinates_stateprovince_consistent(
             df_result["decimalLatitude"],
             df_result["decimalLongitude"],
             df_result.get("stateProvince", pd.Series(dtype="object")),
             gdf=_states_gdf,
         )
     else:
-        df_result["DQ_COORDINATES_COUNTRYCODE_CONSISTENT"] = "EXTERNAL_PREREQUISITES_NOT_MET"
-        df_result["DQ_COORDINATES_STATEPROVINCE_CONSISTENT"] = "EXTERNAL_PREREQUISITES_NOT_MET"
+        df_result["VALIDATION_COORDINATES_COUNTRYCODE_CONSISTENT"] = "EXTERNAL_PREREQUISITES_NOT_MET"
+        df_result["VALIDATION_COORDINATES_STATEPROVINCE_CONSISTENT"] = "EXTERNAL_PREREQUISITES_NOT_MET"
 
     # ---- Non-TGN tests ----
-    df_result["DQ_COORDINATES_NOTZERO"] = test_coordinates_not_zero(
+    df_result["VALIDATION_COORDINATES_NOTZERO"] = test_coordinates_not_zero(
         df_result["decimalLatitude"],
         df_result["decimalLongitude"],
     )
 
-    df_result["DQ_COORDINATEUNCERTAINTY_INRANGE"] = test_coordinate_uncertainty_inrange(
+    df_result["VALIDATION_COORDINATEUNCERTAINTY_INRANGE"] = test_coordinate_uncertainty_inrange(
         df_result.get("coordinateUncertaintyInMeters", pd.Series(dtype="object"))
     )
 
-    df_result["DQ_COUNTRYCODE_NOTEMPTY"] = test_countrycode_not_empty(
+    df_result["VALIDATION_COUNTRYCODE_NOTEMPTY"] = test_countrycode_not_empty(
         df_result.get("countryCode", pd.Series(dtype="object")),
     )
 
-    df_result["DQ_COUNTRYCODE_STANDARD"] = test_countrycode_standard(
+    df_result["VALIDATION_COUNTRYCODE_STANDARD"] = test_countrycode_standard(
         df_result.get("countryCode", pd.Series(dtype="object"))
     )
 
     # ---- TGN-backed (bdq:sourceAuthority default) ----
-    df_result["DQ_COUNTRY_COUNTRYCODE_CONSISTENT"] = test_country_countrycode_consistent(
+    df_result["VALIDATION_COUNTRY_COUNTRYCODE_CONSISTENT"] = test_country_countrycode_consistent(
         df_result.get("country", pd.Series(dtype="object")),
         df_result.get("countryCode", pd.Series(dtype="object")),
         source_authority=TGN_SOURCE_AUTHORITY_DEFAULT,
         source_authority_available=_tgn_is_available,
     )
 
-    df_result["DQ_COUNTRY_STATEPROVINCE_UNAMBIGUOUS"] = test_country_stateprovince_unambiguous(
+    df_result["VALIDATION_COUNTRY_STATEPROVINCE_UNAMBIGUOUS"] = test_country_stateprovince_unambiguous(
         df_result.get("country", pd.Series(dtype="object")),
         df_result.get("stateProvince", pd.Series(dtype="object")),
         source_authority=TGN_SOURCE_AUTHORITY_DEFAULT,
         source_authority_available=_tgn_is_available,
     )
 
-    df_result["DQ_STATEPROVINCE_FOUND"] = test_stateprovince_found(
+    df_result["VALIDATION_STATEPROVINCE_FOUND"] = test_stateprovince_found(
         df_result.get("stateProvince", pd.Series(dtype="object")),
         source_authority=TGN_SOURCE_AUTHORITY_DEFAULT,
         source_authority_available=_tgn_is_available,
     )
 
     # ---- Remaining tests ----
-    df_result["DQ_COUNTRY_FOUND"] = test_country_found(
+    df_result["VALIDATION_COUNTRY_FOUND"] = test_country_found(
         df_result.get("country", pd.Series(dtype="object")),
         source_authority=TGN_SOURCE_AUTHORITY_DEFAULT,
         source_authority_available=_tgn_is_available,
     )
-    df_result["DQ_DECIMALLATITUDE_INRANGE"] = test_decimallatitude_inrange(df_result["decimalLatitude"])
-    df_result["DQ_DECIMALLATITUDE_NOTEMPTY"] = test_decimallatitude_notempty(df_result["decimalLatitude"])
-    df_result["DQ_DECIMALLONGITUDE_INRANGE"] = test_decimallongitude_inrange(df_result["decimalLongitude"])
-    df_result["DQ_DECIMALLONGITUDE_NOTEMPTY"] = test_decimallongitude_notempty(df_result["decimalLongitude"])
-    df_result["DQ_GEODETICDATUM_NOTEMPTY"] = test_geodeticdatum_notempty(
+    df_result["VALIDATION_DECIMALLATITUDE_INRANGE"] = test_decimallatitude_inrange(df_result["decimalLatitude"])
+    df_result["VALIDATION_DECIMALLATITUDE_NOTEMPTY"] = test_decimallatitude_notempty(df_result["decimalLatitude"])
+    df_result["VALIDATION_DECIMALLONGITUDE_INRANGE"] = test_decimallongitude_inrange(df_result["decimalLongitude"])
+    df_result["VALIDATION_DECIMALLONGITUDE_NOTEMPTY"] = test_decimallongitude_notempty(df_result["decimalLongitude"])
+    df_result["VALIDATION_GEODETICDATUM_NOTEMPTY"] = test_geodeticdatum_notempty(
         df_result.get("geodeticDatum", pd.Series(dtype="object"))
     )
 
     # ---- EPSG-backed (bdq:sourceAuthority default = EPSG) ----
-    df_result["DQ_GEODETICDATUM_STANDARD"] = test_geodeticdatum_standard(
+    df_result["VALIDATION_GEODETICDATUM_STANDARD"] = test_geodeticdatum_standard(
         df_result.get("geodeticDatum", pd.Series(dtype="object")),
         source_authority=EPSG_SOURCE_AUTHORITY_DEFAULT,
         source_authority_available=_epsg_is_available,
     )
 
-    df_result["DQ_MAXIMUMELEVATIONINMETERS_INRANGE"] = test_maximumelevation_inrange(
+    df_result["VALIDATION_MAXIMUMELEVATIONINMETERS_INRANGE"] = test_maximumelevation_inrange(
         df_result.get("maximumElevationInMeters", pd.Series(dtype="object"))
     )
 
-    df_result["DQ_MINIMUMELEVATIONINMETERS_INRANGE"] = test_minimumelevation_inrange(
+    df_result["VALIDATION_MINIMUMELEVATIONINMETERS_INRANGE"] = test_minimumelevation_inrange(
         df_result.get("minimumElevationInMeters", pd.Series(dtype="object"))
     )
 
-    df_result["DQ_MINELEVATION_LESSTHAN_MAXELEVATION"] = test_minelevation_lessthan_maxelevation(
+    df_result["VALIDATION_MINELEVATION_LESSTHAN_MAXELEVATION"] = test_minelevation_lessthan_maxelevation(
         df_result.get("minimumElevationInMeters", pd.Series(dtype="object")),
         df_result.get("maximumElevationInMeters", pd.Series(dtype="object")),
     )
 
-    df_result["DQ_LOCATION_NOTEMPTY"] = df_result.apply(test_location_notempty, axis=1)
+    df_result["VALIDATION_LOCATION_NOTEMPTY"] = df_result.apply(test_location_notempty, axis=1)
 
     return df_result
 
@@ -4312,7 +4957,7 @@ with st.spinner("Running Data Quality Validation..."):
 st.markdown("---")
 st.subheader("Data Quality Validation Results")
 
-dq_cols = [c for c in validated_df.columns if c.startswith("DQ_")]
+dq_cols = [c for c in validated_df.columns if c.startswith("VALIDATION_")]
 summary = pd.DataFrame(
     {
         "Test": dq_cols,
@@ -4328,6 +4973,11 @@ summary = pd.DataFrame(
 
 st.dataframe(summary)
 
+st.markdown("##### Click a test name to see its BDQ Standard description")
+for _test_col in dq_cols:
+    with st.expander(_test_col):
+        render_bdq_test_details(_test_col, summary.loc[_test_col].to_dict())
+
 # ============================================================
 # Register this upload "version" in history (date + status only)
 # ============================================================
@@ -4335,7 +4985,7 @@ uploaded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 dataset_status = _dataset_status_from_summary(summary)
 
 # Avoid duplicating identical file uploads
-already = any(h.get("version_id") == version_id for h in st.session_state["upload_history"])
+already = any(h.get("version_id") == version_id for h in st.session_state["upload_history"]) or _is_history_paused_for(version_id)
 if not already:
     st.session_state["upload_history"].append(
         {"uploaded_at": uploaded_at, "version_id": version_id, "status": dataset_status}
@@ -4447,8 +5097,8 @@ st.plotly_chart(fig_bar, use_container_width=True)
 #       "version_id": "v20260126_221530",
 #       "uploaded_at": "2026-01-26 22:15:30",   # or datetime
 #       "test_status": {                         # status per test for this upload version
-#           "DQ_COUNTRY_NOT_EMPTY": "COMPLIANT",
-#           "DQ_COUNTRY_COUNTRYCODE_CONSISTENT": "NOT_COMPLIANT",
+#           "VALIDATION_COUNTRY_NOT_EMPTY": "COMPLIANT",
+#           "VALIDATION_COUNTRY_COUNTRYCODE_CONSISTENT": "NOT_COMPLIANT",
 #           ...
 #       }
 #     }
@@ -4482,7 +5132,7 @@ if "current_version_id" not in st.session_state or st.session_state.get("_new_lo
     st.session_state["current_uploaded_at"] = utc_now_iso()
     st.session_state["_new_load_event"] = False  # you can set this True when a new file is chosen
 
-dq_cols_now = [c for c in validated_df.columns if c.startswith("DQ_") and not c.startswith("DQ_COMMENT_")]
+dq_cols_now = [c for c in validated_df.columns if c.startswith("VALIDATION_") and not c.startswith("VALIDATION_COMMENT_")]
 
 test_counts = {}
 for test_col in dq_cols_now:
@@ -4499,7 +5149,7 @@ for test_col in dq_cols_now:
 
 # Avoid duplicates on rerun (same version_id)
 vid = st.session_state["current_version_id"]
-already = any(isinstance(h, dict) and h.get("version_id") == vid for h in st.session_state.get("upload_history", []))
+already = any(isinstance(h, dict) and h.get("version_id") == vid for h in st.session_state.get("upload_history", [])) or _is_history_paused_for(vid)
 
 if not already:
     record = {
@@ -4585,7 +5235,7 @@ if "current_uploaded_at" not in st.session_state:
 # Compute per-test suspect counts for THIS upload
 dq_cols_now = [
     c for c in validated_df.columns
-    if c.startswith("DQ_") and not c.startswith("DQ_COMMENT_")
+    if c.startswith("VALIDATION_") and not c.startswith("VALIDATION_COMMENT_")
 ]
 
 test_counts = {}
@@ -4603,7 +5253,7 @@ for test_col in dq_cols_now:
     }
 
 # Avoid duplicates on rerun
-already = any(h.get("version_id") == st.session_state["current_version_id"] for h in st.session_state["upload_history"])
+already = any(h.get("version_id") == st.session_state["current_version_id"] for h in st.session_state["upload_history"]) or _is_history_paused_for(st.session_state["current_version_id"])
 if not already:
     st.session_state["upload_history"].append({
         "version_id": st.session_state["current_version_id"],
@@ -4669,11 +5319,38 @@ if "upload_history" in st.session_state and isinstance(st.session_state["upload_
 
 
 
+st.subheader("History Controls")
+st.caption("Applies to the dataset/version history shown in this Panels section below.")
+hc1, hc2 = st.columns(2)
+with hc1:
+    if st.button("🆕 Start New History Session", key="btn_start_new_history"):
+        start_new_history_session()
+        st.success("Started a new history session. Your next upload will be tracked as a fresh entry.")
+        st.rerun()
+with hc2:
+    if st.session_state.get("_confirm_clear_history", False):
+        st.warning("Delete ALL of your saved dataset/version history? This cannot be undone.")
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            if st.button("Yes, clear it", key="btn_confirm_clear_history"):
+                clear_user_history()
+                st.session_state["_confirm_clear_history"] = False
+                st.success("History cleared. It will start tracking again once you upload a new dataset.")
+                st.rerun()
+        with cc2:
+            if st.button("Cancel", key="btn_cancel_clear_history"):
+                st.session_state["_confirm_clear_history"] = False
+                st.rerun()
+    else:
+        if st.button("🗑️ Clear My History", key="btn_clear_history"):
+            st.session_state["_confirm_clear_history"] = True
+            st.rerun()
+
 history = st.session_state.get("upload_history", [])
 history_df = pd.DataFrame(history)
 
 if history_df.empty:
-    st.info("No uploads recorded yet.")
+    st.info("No uploads recorded yet. Upload a dataset above to start tracking.")
     st.stop()
 
 # Parse timestamps
@@ -4839,7 +5516,7 @@ def make_panel_chart(df_in: pd.DataFrame, test_name: str, cumulative: bool, logy
 cols = st.columns(2, vertical_alignment="top")
 
 for i, t in enumerate(panel_tests):
-    title = t.replace("DQ_", "").replace("_", " ").lower()
+    title = t.replace("VALIDATION_", "").replace("_", " ").lower()
 
     with cols[i % 2]:
         st.markdown(
@@ -4863,7 +5540,7 @@ st.header("Map — Points colored by selected test status")
 
 dq_cols_for_map = [
     c for c in validated_df.columns
-    if c.startswith("DQ_") and not c.startswith("DQ_COMMENT_")
+    if c.startswith("VALIDATION_") and not c.startswith("VALIDATION_COMMENT_")
 ]
 
 m1, m2 = st.columns([1, 2], vertical_alignment="top")
@@ -4953,8 +5630,8 @@ with m2:
             }
 
             # Optional comment column for hover (if it exists)
-            test_short = selected_test_map.replace("DQ_", "")
-            comment_col = f"DQ_COMMENT_{test_short}"
+            test_short = selected_test_map.replace("VALIDATION_", "")
+            comment_col = f"VALIDATION_COMMENT_{test_short}"
 
             hover_cols = [selected_test_map, "decimalLatitude", "decimalLongitude"]
             if "country" in map_df.columns:
